@@ -2,7 +2,7 @@ FROM python:alpine
 
 ADD config.py .
 ADD db.py .
-ADD master_multiproc.py .
+ADD kmfetch.py .
 ADD requirements.txt .
 
 WORKDIR .
