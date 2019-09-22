@@ -27,6 +27,7 @@ import multiprocessing as mp
 import sys
 import time
 import threading
+import queue
 
 from pymongo import MongoClient, InsertOne
 import pymongo
@@ -252,23 +253,32 @@ def download_esi_kms(zkill_latest_date=0):
     # Split workload across 2 processes (2 CPU cores on my server)
     if len(new_km_ids) > 0:
         num_ids = len(new_km_ids)
+        num_done_ids = 0
         split_num = int(num_ids / 2)
         proc_1_ids = new_km_ids[:split_num]
         proc_2_ids = new_km_ids[split_num:]
 
+        process_q = mp.Queue()
+
         proc_1 = mp.Process(
             target=esi_threads,
-            args=(proc_1_ids,)
+            args=(proc_1_ids, process_q,)
         )
         proc_1.start()
         Logger.info("[download_esi_kms] Process 1 started.")
 
         proc_2 = mp.Process(
             target=esi_threads,
-            args=(proc_2_ids,)
+            args=(proc_2_ids, process_q,)
         )
         proc_2.start()
         Logger.info("[download_esi_kms] Process 2 started.")
+
+        while proc_1.is_alive() or proc_2.is_alive():
+            process_q.get(block=True)
+            num_done_ids += 1
+            print("Progress" + "{:.3%}".format(num_done_ids/num_ids) + " - ({}/{})".format(num_done_ids, num_ids), end='\r')
+
 
         proc_1.join()
         Logger.info("[download_esi_kms] Process 1 finished.")
@@ -280,7 +290,7 @@ def download_esi_kms(zkill_latest_date=0):
     return len(new_km_ids), new_km_ids
 
 
-def esi_threads(kill_ids):
+def esi_threads(kill_ids, process_q):
     """
     Starts a new thread for each download request from CCP's ESI.
 
@@ -295,6 +305,8 @@ def esi_threads(kill_ids):
     col_esi_fork = db_fork.esi_kms
     col_esi_retry_fork = db_fork.retry
 
+    thread_q = queue.Queue()
+
     for kill_id in kill_ids:
         hash = col_zkill_fork.find_one({"kill_id": kill_id})["hash"]
         while True:
@@ -302,16 +314,18 @@ def esi_threads(kill_ids):
                 t = threading.Thread(
                     target=get_kill_details,
                     daemon=False,
-                    args=(kill_id, hash, col_esi_fork, col_esi_retry_fork)
+                    args=(kill_id, hash, col_esi_fork, col_esi_retry_fork, thread_q)
                     )
                 t.start()
+                while not thread_q.empty():
+                    process_q.put(thread_q.get())
                 time.sleep(0.02)
                 break
             else:
                 time.sleep(0.1)
 
 
-def get_kill_details(id, hash, col_esi_fork, col_esi_retry_fork):
+def get_kill_details(id, hash, col_esi_fork, col_esi_retry_fork, thread_q):
     """
     Downloads a killmail from CCP's ESI and stores it in `DB.esi_kms`.
     Adds the field `killmail_date` as integer in format YYYYMMDD. Where
@@ -361,7 +375,7 @@ def get_kill_details(id, hash, col_esi_fork, col_esi_retry_fork):
             mongo_attempt += 1
             try:
                 col_esi_fork.insert_one(kill_dict)
-                print("Downloaded killmail_id: " + str(id), end='\r')
+                thread_q.put(id)
                 break
             except pymongo.errors.DuplicateKeyError:
                 print("Killmail_id duplicate ignored:" + str(id))
@@ -604,7 +618,8 @@ def create_km_summaries(retry_ids=None):
         if not "character_id" in km["victim"]:  # not interested in structure kills
             structure_kms += 1
             COL_NEW.delete_many({"killmail_id": id})
-            print("KM summary progress: " + "{:.3%}".format(kms_processed / len(process_ids)), end='\r')
+            print("KM summary progress: " + "{:.3%}".format(kms_processed / len(process_ids)) +
+                  " - ({}/{})".format(kms_processed, len(process_ids)), end='\r')
             continue
         killmail_id = km["killmail_id"]
         killmail_date = km["killmail_date"]
