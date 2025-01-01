@@ -5,7 +5,6 @@
 import os
 import sqlite3
 import logging
-import config
 # cSpell Checker - Correct Words****************************************
 # // cSpell:words sqlite, DECLTYPES, isfile, pyspy, cyno
 # **********************************************************************
@@ -22,7 +21,7 @@ def connect_db():
     :return: SQLite connection object
     '''
 
-    DB_DIR = config.DATA_PATH
+    DB_DIR = '/'
     # If script runs for the first time, may have to create the
     # subdirectory for the database file (DB_DIR).
     if not os.path.exists(DB_DIR):

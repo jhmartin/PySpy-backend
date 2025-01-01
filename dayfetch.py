@@ -15,6 +15,14 @@ import boto3
 import db
 
 Logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format='%(asctime)s [%(levelname)s]: %(message)s',
+    encoding='utf-8',
+    level=logging.INFO)
+
+session = boto3.Session(region_name='us-west-2')
+dynamodb = session.resource('dynamodb')
+table = dynamodb.Table('pyspy-intel')
 
 # Example call: Logger.info("Something badhappened", exc_info=True) ****
 
@@ -69,7 +77,7 @@ def get_latest_killmail_date(connection: sqlite3.Connection) -> str:
         result = cursor.fetchone()
         return result['latest_killmail_date'] if result and result['latest_killmail_date'] is not None else None
     except sqlite3.Error as e:
-        Logger.exception("sqlite errir occured", exc_info=True)
+        Logger.exception("sqlite error occured", exc_info=True)
         raise e
 
 
@@ -108,6 +116,7 @@ def fetch_and_unpack_killmail(date: str):
                 if f:
                     # Processing file contents, here just printing the file
                     # name
+                    Logger.debug(f)
                     results.append(json.load(f))
                     # Example to read the file content: content = f.read()
             return results
@@ -164,10 +173,12 @@ def get_attacker_info(killmail: dict) -> (int, set[int]):
 def create_killmail_summaries(killmails: list[dict]):
     """ Take a list of killmails and construct the KM summary info"""
     Logger.info("Killmail total is %s", len(killmails))
-    summaries = []
+    km_summaries = []
+    atk_summaries = []
     result_attackers = set()
     result_victims = set()
     for killmail in killmails:
+        Logger.debug(killmail)
         if 'victim' not in killmail or 'character_id' not in killmail['victim']:
             continue
 
@@ -185,7 +196,7 @@ def create_killmail_summaries(killmails: list[dict]):
         result_attackers.update(attacker_ids)
         result_victims.add(victim_id)
 
-        summary = (
+        km_summary = (
             killmail_id,
             killmail_date,
             solar_system_id,
@@ -196,10 +207,22 @@ def create_killmail_summaries(killmails: list[dict]):
             covert_cyno,
             normal_cyno
         )
-        summaries.append(summary)
-    Logger.info("Candidate killmails are %s", len(summaries))
+        km_summaries.append(km_summary)
+
+        for attacker_id in attacker_ids:
+            atk_summary = (
+                killmail_id,
+                killmail_date,
+                attacker_id,
+                attacker_count
+            )
+
+            atk_summaries.append(atk_summary)
+
+    Logger.info("Candidate killmails are %s", len(km_summaries))
     Logger.info("Distinct attackers is %s", len(result_attackers))
-    return (summaries, result_attackers, result_victims)
+    return (km_summaries, atk_summaries,
+            result_attackers, result_victims)
 
 
 def dict_factory(cursor, row):
@@ -215,11 +238,11 @@ def clean_dict(in_dict: dict) -> dict:
 
 def insert_item(item, dest_table):
     """ Upload a intel item to DynamoDB. Have to handle throughput exceptions with increasing delay retries.
-    There is a batch upload command, but we have to handle partial success. Avoiding that is simpler for daily uploads"""
+     a batch upload command, but we have to handle partial success. Avoiding that is simpler for daily uploads"""
     item = json.loads(json.dumps(item), parse_float=decimal.Decimal)
     for attempt in range(1, 6):  # Retry up to 5 times
         try:
-            dest_table.put_item(Item=item)
+            response = dest_table.put_item(Item=item)
             return
         except ClientError as err:
             if err.response['Error']['Code'] not in [
@@ -229,9 +252,22 @@ def insert_item(item, dest_table):
             time.sleep(2 ** attempt)
 
 
+def persist_attacker_summaries(atk_summaries, sqlcon):
+    """ Write the attacker summaries to sqlite"""
+    Logger.info(
+        "Persisting %s attacker summaries into sqlite",
+        len(atk_summaries))
+    # Write to sql in a tight batch to reduce round-trops
+    sqlcon.executemany(
+        '''REPLACE INTO attackers (killmail_id, killmail_date, attacker_id, attacker_count) VALUES (?, ?, ?, ?)''',
+        atk_summaries)
+    sqlcon.commit()
+    Logger.info("Finished persisting attacker summaries into sqlite")
+
+
 def persist_killmail_summaries(km_summaries, sqlcon):
     """ Write the killmail summaries to sqlite"""
-    Logger.info("Persisting killmails into sqlite")
+    Logger.info("Persisting %s killmails into sqlite", len(km_summaries))
     # Write to sql in a tight batch to reduce round-trops
     sqlcon.executemany(
         '''REPLACE INTO km_summary (killmail_id, killmail_date,
@@ -243,9 +279,10 @@ def persist_killmail_summaries(km_summaries, sqlcon):
     Logger.info("Finished persisting killmails into sqlite")
 
 
-def fetch_victim_intel_js(victims, cursor) -> list:
+def fetch_victim_intel(victims, cursor) -> list:
     """ Given a list of victims, fetch their data out of the sqlite view"""
     Logger.info("Identified %s victims to update", len(victims))
+    Logger.debug(victims)
     vic_data = cursor.execute(
         '''SELECT * FROM vic_sum WHERE character_id IN
             (%s)''' % (', '.join(['?'] * len(victims))),
@@ -254,9 +291,10 @@ def fetch_victim_intel_js(victims, cursor) -> list:
     return vic_data
 
 
-def fetch_attacker_intel_js(attackers, cursor) -> list:
+def fetch_attacker_intel(attackers, cursor) -> list:
     """ Given a list of attackers, fetch their data out of the sqlite view"""
     Logger.info("Identified %s attackers to update", len(attackers))
+    Logger.debug(attackers)
     atk_data = cursor.execute(
         '''SELECT * FROM atk_sum WHERE character_id IN
             (%s)''' % (', '.join(['?'] * len(attackers))),
@@ -265,29 +303,22 @@ def fetch_attacker_intel_js(attackers, cursor) -> list:
     return atk_data
 
 
-session = boto3.Session(region_name='us-west-2')
-dynamodb = session.resource('dynamodb')
-table = dynamodb.Table('pyspy-intel')
-
 if __name__ == "__main__":
     sql = db.connect_db()
     sql.row_factory = dict_factory
     cur = sql.cursor()
     latest_date = get_latest_killmail_date(sql)
     date_range = generate_date_range(str(latest_date))
-    date_range = generate_date_range(str(20241217))
 
     for km_date in date_range:
         Logger.info("Processing data for %s", km_date)
         day_killmails = fetch_and_unpack_killmail(str(km_date))
-        (killmail_summaries, touched_attackers,
+        (killmail_summaries, attacker_summaries, touched_attackers,
          touched_victims) = create_killmail_summaries(day_killmails)
         persist_killmail_summaries(killmail_summaries, sql)
-
-        # boto3.set_stream_logger('', logging.DEBUG)
-
-        victim_data = fetch_victim_intel_js(touched_victims, cur)
-        attacker_data = fetch_attacker_intel_js(touched_attackers, cur)
+        persist_attacker_summaries(attacker_summaries, sql)
+        victim_data = fetch_victim_intel(touched_victims, cur)
+        attacker_data = fetch_attacker_intel(touched_attackers, cur)
 
         all_data = victim_data + attacker_data
         total_len = len(all_data)
