@@ -5,7 +5,6 @@
 import os
 import sqlite3
 import logging
-import config
 # cSpell Checker - Correct Words****************************************
 # // cSpell:words sqlite, DECLTYPES, isfile, pyspy, cyno
 # **********************************************************************
@@ -22,7 +21,7 @@ def connect_db():
     :return: SQLite connection object
     '''
 
-    DB_DIR = config.DATA_PATH
+    DB_DIR = '/'
     # If script runs for the first time, may have to create the
     # subdirectory for the database file (DB_DIR).
     if not os.path.exists(DB_DIR):
@@ -44,8 +43,9 @@ def connect_db():
         sqlite3.register_converter("BOOL", lambda v: bool(int(v)))
 
         con.execute("PRAGMA journal_mode = TRUNCATE")
+        prepare_tables(con)
         if create_new_db:
-            prepare_tables(con)
+            print('prepped tables')
             prepare_indexes(con)
         return con
     except Exception:
@@ -78,16 +78,18 @@ def prepare_tables(con):
         SELECT victim_id, ship_id FROM km_summary
         WHERE normal_cyno=1 ORDER BY killmail_id DESC'''
         )
+    con.execute('DROP VIEW atk_sum')
     con.execute(
         '''CREATE VIEW atk_sum AS
-        SELECT attackers.attacker_id, count(attackers.killmail_id) AS kills,
+        SELECT attackers.attacker_id AS character_id, count(attackers.killmail_id) AS kills,
         avg(attackers.attacker_count) AS avg_attackers,
         max(killmail_date) AS last_kill_date
         FROM attackers GROUP BY attacker_id'''
         )
+    con.execute('DROP VIEW vic_sum')
     con.execute(
         '''CREATE VIEW vic_sum AS
-        SELECT victim_id, count(killmail_id) AS losses,
+        SELECT victim_id AS character_id, count(killmail_id) AS losses,
         total(covert_cyno)/count(killmail_id) AS covert_prob,
         total(normal_cyno)/count(killmail_id) AS normal_prob,
         sum(abyssal) AS abyssal_losses,
