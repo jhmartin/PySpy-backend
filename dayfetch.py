@@ -104,7 +104,9 @@ def fetch_and_unpack_killmail(date: str):
 
     # Download the file with timeout and headers
     response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
+    if response.status_code == 404:
+        return []
+
     if response.status_code == 200:
         # Unpack the tar.bz2 file in memory
         file_like_object = BytesIO(response.content)
