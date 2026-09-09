@@ -126,7 +126,7 @@ def fetch_and_unpack_killmail(date: str):
         Logger.error(
             "Failed to download file from %s. Status code: %s",
             url,
-            response.stastus_code)
+            response.status_code)
         raise Exception("Unable to download file {response.status_code}")
 
 
