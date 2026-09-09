@@ -104,7 +104,9 @@ def fetch_and_unpack_killmail(date: str):
 
     # Download the file with timeout and headers
     response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
+    if response.status_code == 404:
+        return []
+
     if response.status_code == 200:
         # Unpack the tar.bz2 file in memory
         file_like_object = BytesIO(response.content)
@@ -124,7 +126,7 @@ def fetch_and_unpack_killmail(date: str):
         Logger.error(
             "Failed to download file from %s. Status code: %s",
             url,
-            response.stastus_code)
+            response.status_code)
         raise Exception("Unable to download file {response.status_code}")
 
 
@@ -235,14 +237,35 @@ def clean_dict(in_dict: dict) -> dict:
     """ Remove all dict keys that have null/none values """
     return {k: v for k, v in in_dict.items() if v is not None}
 
+def build_update_expression(data):
+    update_parts = []
+    expression_attribute_names = {}
+    expression_attribute_values = {}
 
-def insert_item(item, dest_table):
+    for i, (key, value) in enumerate(data.items()):
+        name_placeholder = f"#k{i}"
+        value_placeholder = f":v{i}"
+
+        update_parts.append(f"{name_placeholder} = {value_placeholder}")
+        expression_attribute_names[name_placeholder] = key
+        expression_attribute_values[value_placeholder] = value
+
+    return {
+        "UpdateExpression": "SET " + ", ".join(update_parts),
+        "ExpressionAttributeNames": expression_attribute_names,
+        "ExpressionAttributeValues": expression_attribute_values,
+    }
+
+def upsert_item(item, dest_table):
     """ Upload a intel item to DynamoDB. Have to handle throughput exceptions with increasing delay retries.
-     a batch upload command, but we have to handle partial success. Avoiding that is simpler for daily uploads"""
+     This could be batch upload commands, but we have to handle partial success. Avoiding that is simpler for daily uploads"""
+    character_id = item['character_id']
+    item.pop('character_id')
     item = json.loads(json.dumps(item), parse_float=decimal.Decimal)
+    expression = build_update_expression(item)
     for attempt in range(1, 6):  # Retry up to 5 times
         try:
-            response = dest_table.put_item(Item=item)
+            response = dest_table.update_item(Key={'character_id': character_id}, **expression)
             return
         except ClientError as err:
             if err.response['Error']['Code'] not in [
@@ -326,6 +349,6 @@ if __name__ == "__main__":
         for update in all_data:
             Logger.info("Uploading %s/%s for %s", PROGRESS, total_len, km_date)
             PROGRESS += 1
-            insert_item(update, table)
+            upsert_item(update, table)
 
     sql.close()
